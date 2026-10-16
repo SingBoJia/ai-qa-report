@@ -54,7 +54,12 @@ jobs:
 
       - name: Strip (unix)
         if: runner.os != 'Windows'
-        run: strip target/${{ matrix.target }}/release/ai-qa-report
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            aarch64-linux-gnu-strip target/${{ matrix.target }}/release/ai-qa-report
+          else
+            strip target/${{ matrix.target }}/release/ai-qa-report
+          fi
 
       - name: Rename artifact
         shell: bash
