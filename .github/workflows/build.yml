@@ -1,0 +1,65 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: ai-qa-report-linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: ai-qa-report-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: ai-qa-report-macos-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ai-qa-report-windows-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip (unix)
+        if: runner.os != 'Windows'
+        run: strip target/${{ matrix.target }}/release/ai-qa-report
+
+      - name: Rename artifact
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/ai-qa-report.exe ${{ matrix.artifact }}.exe
+          else
+            cp target/${{ matrix.target }}/release/ai-qa-report ${{ matrix.artifact }}
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}*
+
+      - name: Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}*

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>电脑 AI 问答记录梳理报告 · __GENTIME__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:"Microsoft YaHei",system-ui,sans-serif;background:#0f1117;color:#e5e7eb;padding:32px 20px}
+.wrap{max-width:1280px;margin:0 auto}
+h1{font-size:26px;margin-bottom:6px}
+.sub{color:#9ca3af;font-size:13px;margin-bottom:24px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:24px}
+.card{background:#171a23;border:1px solid #232838;border-radius:12px;padding:14px 16px}
+.card .n{font-size:24px;font-weight:700}
+.card .l{font-size:12px;color:#9ca3af;margin-top:2px}
+.chips{margin-bottom:16px;display:flex;flex-wrap:wrap;gap:8px}
+.chip{background:#171a23;color:#e5e7eb;border:1px solid #333;padding:6px 14px;border-radius:20px;cursor:pointer;font-size:13px}
+.chip.active{outline:2px solid #fff}
+.chip b{opacity:.7}
+input#q{width:100%;padding:10px 14px;border-radius:10px;border:1px solid #2a3040;background:#171a23;color:#e5e7eb;font-size:14px;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;background:#12141c;border-radius:12px;overflow:hidden;border:1px solid #232838}
+th{background:#1a1e2b;text-align:left;padding:10px 12px;font-size:12px;color:#9ca3af;position:sticky;top:0}
+td{padding:10px 12px;border-top:1px solid #1d2230;font-size:13px;vertical-align:top}
+tr:hover td{background:#171b28}
+.t{white-space:nowrap;color:#9ca3af;font-size:12px}
+.badge{display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;color:#fff;white-space:nowrap}
+.w{max-width:520px}
+.d{color:#6b7280;font-size:11px;margin-top:3px}
+.f{color:#67e8f9;font-size:11px;word-break:break-all;max-width:260px;font-family:Consolas,monospace}
+.foot{margin-top:20px;color:#6b7280;font-size:12px;line-height:1.8}
+.showing{color:#9ca3af;font-size:12px;margin-bottom:8px}
+@media(max-width:800px){.t,.f{display:none}}
+</style></head><body><div class="wrap">
+<h1>🖥️ 电脑 AI 问答记录梳理报告</h1>
+<div class="sub">生成时间 __GENTIME__ ｜ 由 ai-qa-report.exe 自动生成 ｜ 扫描 8 个 AI 工具数据源 ｜ 共 __TOTAL__ 条会话（已剔除 __TRIVIAL__ 条测试会话、__DUPE__ 条重复请求、__AUTO__ 条系统自动任务）</div>
+<div class="cards">__CARDS__</div>
+<div class="chips">__CHIPS__</div>
+<input id="q" placeholder="🔍 搜索关键词（标题/目录）…" oninput="search()">
+<div class="showing" id="cnt"></div>
+<table><thead><tr><th>时间</th><th>工具</th><th>做了啥</th><th>记录所在文件夹</th></tr></thead>
+<tbody id="tb">
+__ROWS__
+</tbody></table>
+<div class="foot">
+<b>数据源说明</b><br>
+· ZCode：~/.zcode/cli/db/db.sqlite（session 表）＋ ~/.zcode/cli/rollout/（model-io 日志）<br>
+· Codex CLI：~/.codex/sessions/（按 年/月/日 存放 rollout jsonl，多为 zst 压缩）＋ ~/.codex/archived_sessions/；空会话未列出<br>
+· Claude Code：~/.claude/projects/（会话 jsonl）<br>
+· Gemini Antigravity：~/.gemini/antigravity/conversations/（.pb，会话体加密无法提取标题）<br>
+· 豆包桌面版：~/Doubao/chats/（按日期的对话文件夹，产物落盘；完整聊天记录在 AppData 加密库内无法直读）<br>
+· WorkBuddy / WorkBuddy AI：~/WorkBuddy/ 与 ~/WorkBuddy AI/（按时间戳的产物文件夹）<br>
+· LobsterAI：~/AppData/Roaming/LobsterAI/lobsterai.sqlite（cowork_sessions 表）<br><br>
+摘要规则：取每个会话<b>首条用户消息</b>作为"做了啥"；hi/hello/你是什么模型类测试会话、同一工具内首条消息完全相同的重复会话、系统自动注入的 agent history 任务已剔除（共 __REMOVED__ 条）。
+</div></div>
+<script>
+function filt(t, el){document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active')});if(el)el.classList.add('active');
+document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=(!t||r.dataset.tool===t)?'':'none'});cnt()}
+function search(){var q=document.getElementById('q').value.toLowerCase();
+document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'});cnt()}
+function cnt(){var v=0;document.querySelectorAll('#tb tr').forEach(function(r){if(r.style.display!=='none')v++});
+document.getElementById('cnt').textContent='显示 '+v+' / __TOTAL__ 条'}
+cnt()
+</script></body></html>

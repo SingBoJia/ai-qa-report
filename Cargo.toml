@@ -1,0 +1,18 @@
+[package]
+name = "ai-qa-report"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+zstd = "0.13"
+serde_json = "1"
+chrono = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

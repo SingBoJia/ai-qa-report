@@ -1,0 +1,8 @@
+/target
+
+# local build artifacts (CI builds these)
+*.exe
+ai-qa-report
+
+# report output
+AI问答记录梳理报告.html
