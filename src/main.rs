@@ -39,6 +39,8 @@ struct Row {
     what: String,
     folder: String,
     detail: String,
+    // 删除目标：tool|具体路径或id。空 = 不可删
+    del_id: String,
 }
 
 fn esc(s: &str) -> String {
@@ -105,6 +107,7 @@ fn load_zcode() -> Result<Vec<Row>> {
             what: summ(&title.unwrap_or_default()),
             folder: "~/.zcode/cli/db/db.sqlite".into(),
             detail: format!("工作目录: {}", dir.unwrap_or_else(|| "-".into())),
+            del_id: String::new(),
         });
     }
     Ok(rows)
@@ -139,6 +142,7 @@ fn load_claude() -> Result<Vec<Row>> {
                 what: summ(&first_user),
                 folder: format!("~/.claude/{}", rel_short),
                 detail: format!("项目: {} ｜ 用户消息数: {}", proj, n_msg),
+                del_id: f.to_string_lossy().to_string(),
             });
         }
     }
@@ -240,6 +244,7 @@ fn load_codex() -> Result<Vec<Row>> {
             } else {
                 format!("工作目录: {}", cwd)
             },
+            del_id: f.to_string_lossy().to_string(),
         });
     }
     Ok(rows)
@@ -380,6 +385,7 @@ fn load_doubao() -> Result<Vec<Row>> {
                     n_files,
                     files.iter().take(3).cloned().collect::<Vec<_>>().join("、")
                 ),
+                del_id: cpath.to_string_lossy().to_string(),
             });
         }
     }
@@ -405,8 +411,74 @@ fn collect_rel_files(base: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 // ---------- Gemini Antigravity: ~/.gemini/antigravity/conversations/*.pb ----------
+// 会话体 .pb 是 ChaCha20-Poly1305 加密，但标题索引在 ~/.gemini/antigravity/agyhub_summaries_proto.pb
+// （未加密 protobuf：record{1:uuid, 2{1:title, ...}, ...}），解析它拿 uuid->title。
+fn parse_pb_fields(buf: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    let mut out = vec![];
+    let mut i = 0usize;
+    let read_varint = |i: &mut usize| -> Option<u64> {
+        let mut r: u64 = 0;
+        let mut s: u32 = 0;
+        loop {
+            let b = *buf.get(*i)?; *i += 1;
+            r |= ((b & 0x7f) as u64) << s;
+            if b & 0x80 == 0 { return Some(r); }
+            s += 7;
+            if s > 63 { return None; }
+        }
+    };
+    while i < buf.len() {
+        let key = match read_varint(&mut i) { Some(k) => k, None => break };
+        let (fnum, ftype) = ((key >> 3) as u32, key & 7);
+        match ftype {
+            0 => { if read_varint(&mut i).is_none() { break } out.push((fnum, vec![])); }
+            2 => {
+                let ln = match read_varint(&mut i) { Some(l) => l as usize, None => break };
+                if i + ln > buf.len() { break }
+                out.push((fnum, buf[i..i + ln].to_vec()));
+                i += ln;
+            }
+            5 => { if i + 4 > buf.len() { break } i += 4; }
+            1 => { if i + 8 > buf.len() { break } i += 8; }
+            _ => break,
+        }
+    }
+    out
+}
+
+fn load_ag_titles() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let p = home_dir().join(".gemini/antigravity/agyhub_summaries_proto.pb");
+    let Ok(raw) = fs::read(&p) else { return map };
+    for (_, rec) in parse_pb_fields(&raw) {
+        let mut uuid = String::new();
+        let mut title = String::new();
+        for (f2, v2) in parse_pb_fields(&rec) {
+            if f2 == 1 && uuid.is_empty() {
+                if let Ok(s) = String::from_utf8(v2.clone()) {
+                    if s.len() == 36 && s.as_bytes()[8] == b'-' { uuid = s; }
+                }
+            }
+            if f2 == 2 && title.is_empty() {
+                for (f3, v3) in parse_pb_fields(&v2) {
+                    if f3 == 1 {
+                        if let Ok(s) = String::from_utf8(v3) { title = s; }
+                        break;
+                    }
+                }
+            }
+            if !uuid.is_empty() && !title.is_empty() { break }
+        }
+        if !uuid.is_empty() && !title.is_empty() {
+            map.insert(uuid, title);
+        }
+    }
+    map
+}
+
 fn load_antigravity() -> Result<Vec<Row>> {
-    let base = PathBuf::from(format!("{}/.gemini/antigravity/conversations", home_dir().display()));
+    let base = home_dir().join(".gemini/antigravity/conversations");
+    let titles = load_ag_titles();
     let mut rows = vec![];
     if !base.exists() {
         return Ok(rows);
@@ -419,13 +491,18 @@ fn load_antigravity() -> Result<Vec<Row>> {
     for f in files {
         let meta = fs::metadata(&f)?;
         let mt: DateTime<Local> = meta.modified().map(|m| m.into())?;
-        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+        let what = match titles.get(&stem) {
+            Some(t) if !t.trim().is_empty() => t.clone(),
+            _ => "(标题不在摘要索引中，会话体加密)".into(),
+        };
         rows.push(Row {
             tool: "Gemini Antigravity",
             time: mt.format("%Y-%m-%d %H:%M").to_string(),
-            what: "(会话体为加密二进制，标题不可读)".into(),
-            folder: format!("~/.gemini/antigravity/conversations/{}", name),
+            what: summ(&what),
+            folder: format!("~/.gemini/antigravity/conversations/{}.pb", stem),
             detail: format!("大小: {} KB", meta.len() / 1024),
+            del_id: f.to_string_lossy().to_string(),
         });
     }
     Ok(rows)
@@ -469,6 +546,7 @@ fn load_workbuddy() -> Result<Vec<Row>> {
                     d.to_string_lossy().replace('\\', "/").replace(&hd, "~")
                 },
                 detail: real.iter().take(6).cloned().collect::<Vec<_>>().join("、"),
+                del_id: d.to_string_lossy().to_string(),
             });
         }
     }
@@ -483,7 +561,7 @@ fn load_lobster() -> Result<Vec<Row>> {
     }
     let con = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let mut stmt = con.prepare(
-        "SELECT title, status, cwd, created_at FROM cowork_sessions ORDER BY created_at",
+        "SELECT title, status, cwd, created_at, id FROM cowork_sessions ORDER BY created_at",
     )?;
     let mut rows = vec![];
     let iter = stmt.query_map([], |r| {
@@ -492,10 +570,11 @@ fn load_lobster() -> Result<Vec<Row>> {
             r.get::<_, Option<String>>(1)?,
             r.get::<_, Option<String>>(2)?,
             r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<String>>(4)?,
         ))
     })?;
     for r in iter {
-        let (title, status, cwd, ts) = r?;
+        let (title, status, cwd, ts, id) = r?;
         rows.push(Row {
             tool: "LobsterAI",
             time: ms2str(ts.unwrap_or(0)),
@@ -506,6 +585,7 @@ fn load_lobster() -> Result<Vec<Row>> {
                 status.unwrap_or_else(|| "-".into()),
                 cwd.unwrap_or_else(|| "-".into())
             ),
+            del_id: id.unwrap_or_default(),
         });
     }
     Ok(rows)
@@ -587,16 +667,24 @@ fn build_html(f: &Filtered) -> String {
     let total = f.rows.len();
 
     let mut trs = String::new();
-    for r in &f.rows {
+    for (idx, r) in f.rows.iter().enumerate() {
         let color = TOOL_COLOR
             .iter()
             .find(|(t, _)| *t == r.tool)
             .map(|(_, c)| *c)
             .unwrap_or("#64748b");
+        let del_btn = if r.del_id.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<button class=\"del\" onclick=\"delRow({},this)\" title=\"移入回收目录（可恢复）\">✕</button>",
+                idx
+            )
+        };
         trs.push_str(&format!(
-            "<tr data-tool=\"{}\"><td class=\"t\">{}</td><td><span class=\"badge\" style=\"background:{}\">{}</span></td><td class=\"w\">{}<div class=\"d\">{}</div></td><td class=\"f\">{}</td></tr>\n",
-            esc(r.tool), esc(&r.time[..r.time.len().min(16)]), color, esc(r.tool),
-            esc(&r.what), esc(&r.detail), esc(&r.folder)
+            "<tr data-tool=\"{}\" data-idx=\"{}\"><td class=\"t\">{}</td><td><span class=\"badge\" style=\"background:{}\">{}</span></td><td class=\"w\">{}<div class=\"d\">{}</div></td><td class=\"f\">{}</td><td class=\"delc\">{}</td></tr>\n",
+            esc(r.tool), idx, esc(&r.time[..r.time.len().min(16)]), color, esc(r.tool),
+            esc(&r.what), esc(&r.detail), esc(&r.folder), del_btn
         ));
     }
 
@@ -629,6 +717,18 @@ fn build_html(f: &Filtered) -> String {
 }
 
 fn main() -> Result<()> {
+    // serve 模式: ai-qa-report.exe serve [port]  → 启动本地服务，页面删除按钮可用
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && args[1] == "serve" {
+        let port: u16 = args.get(2).map(|p| p.parse().unwrap_or(8765)).unwrap_or(8765);
+        return serve(port);
+    }
+    run_build()?;
+    // 构建后自动以 serve 模式拉起本地服务（后台不阻塞由用户决定）
+    Ok(())
+}
+
+fn run_build() -> Result<()> {
     println!("[1/4] 扫描数据源…");
     let mut all = vec![];
     all.extend(load_zcode().unwrap_or_else(|e| { eprintln!("  zcode 失败: {e}"); vec![] }));
@@ -646,6 +746,11 @@ fn main() -> Result<()> {
     println!("  剔除 测试{} / 重复{} / 自动{}，保留 {} 条",
         f.n_trivial, f.n_dupe, f.n_auto, f.rows.len());
 
+    // 保存行索引 → 删除目标映射，供 serve 模式删除时定位
+    let map: Vec<String> = f.rows.iter().map(|r| format!("{}\t{}", r.tool, r.del_id)).collect();
+    let _ = fs::create_dir_all(out_dir());
+    fs::write(out_dir().join("delmap.tsv"), map.join("\n"))?;
+
     println!("[3/4] 生成 HTML…");
     let html = build_html(&f);
 
@@ -654,5 +759,155 @@ fn main() -> Result<()> {
     let out = out.to_string_lossy().to_string();
     fs::write(&out, html)?;
     println!("完成: {}", out);
+    Ok(())
+}
+
+// ---------- 删除：把目标移入回收目录（不真删，可恢复） ----------
+fn trash_target(tool: &str, target: &str) -> Result<String> {
+    let p = PathBuf::from(target);
+    if !p.exists() {
+        anyhow::bail!("目标不存在: {}", target);
+    }
+    // 安全: 只允许删已知数据源前缀下的路径
+    let hd = home_dir().to_string_lossy().replace('\\', "/");
+    let norm = target.replace('\\', "/");
+    let allowed = [
+        format!("{}/.claude/projects/", hd),
+        format!("{}/.codex/sessions/", hd),
+        format!("{}/.codex/archived_sessions/", hd),
+        format!("{}/Doubao/chats/", hd),
+        format!("{}/.gemini/antigravity/conversations/", hd),
+        format!("{}/WorkBuddy/", hd),
+        format!("{}/WorkBuddy AI/", hd),
+    ];
+    if !allowed.iter().any(|a| norm.starts_with(a.as_str())) {
+        anyhow::bail!("路径不在允许的数据源目录内，拒绝删除");
+    }
+    let stamp = Local::now().format("%Y%m%d-%H%M%S");
+    let dest_dir = out_dir().join("recycle").join(format!("{}-{}", tool.replace(' ', "_"), stamp));
+    fs::create_dir_all(&dest_dir)?;
+    let dest = dest_dir.join(p.file_name().unwrap_or_default());
+    if p.is_dir() {
+        fs_extra_like_move_dir(&p, &dest)?;
+    } else {
+        fs::rename(&p, &dest).or_else(|_| {
+            fs::copy(&p, &dest)?;
+            fs::remove_file(&p)
+        })?;
+    }
+    // Antigravity: 同时清掉摘要索引里的记录由应用自行处理；这里额外备份摘要文件
+    Ok(dest_dir.to_string_lossy().to_string())
+}
+
+fn fs_extra_like_move_dir(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest)?;
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let from = e.path();
+        let to = dest.join(e.file_name());
+        if from.is_dir() {
+            fs_extra_like_move_dir(&from, &to)?;
+            fs::remove_dir_all(&from)?;
+        } else {
+            fs::rename(&from, &to).or_else(|_| {
+                fs::copy(&from, &to)?;
+                fs::remove_file(&from)
+            })?;
+        }
+    }
+    fs::remove_dir(src)?;
+    Ok(())
+}
+
+// ---------- serve 模式：极简 HTTP（std only, 无依赖） ----------
+use std::io::{Write as IoWrite};
+use std::net::{TcpListener, TcpStream};
+
+fn serve(port: u16) -> Result<()> {
+    run_build()?;
+    let delmap_raw = fs::read_to_string(out_dir().join("delmap.tsv")).unwrap_or_default();
+    let delmap: Vec<(String, String)> = delmap_raw
+        .lines()
+        .map(|l| {
+            let mut it = l.splitn(2, '\t');
+            (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
+        })
+        .collect();
+    let report_path = std::sync::Arc::new(out_dir().join("AI问答记录梳理报告.html"));
+
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
+    println!("服务已启动: http://127.0.0.1:{} （Ctrl+C 停止）", port);
+    println!("页面删除按钮可用；删除 = 移入 {} (可恢复)", out_dir().join("recycle").display());
+
+    let delmap = std::sync::Arc::new(std::sync::Mutex::new(delmap));
+    let report_path_c = report_path.clone();
+    std::thread::spawn(move || {
+        // 每 60s 重建一次报告，让删除后其他打开的页面也保持最新
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = run_build();
+        }
+    });
+    let _ = report_path_c;
+    for stream in listener.incoming() {
+        let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+        let delmap = delmap.clone();
+        let report_path = report_path.clone();
+        std::thread::spawn(move || {
+            let _ = handle_conn(&mut stream, &delmap, &report_path);
+        });
+    }
+    Ok(())
+}
+
+fn handle_conn(stream: &mut TcpStream, delmap: &std::sync::Mutex<Vec<(String, String)>>, report_path: &Path) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    let n = stream.read(&mut buf)?;
+    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+    let first_line = req.lines().next().unwrap_or("");
+    let mut parts = first_line.split(' ');
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("/");
+
+    if method == "GET" && (path == "/" || path.starts_with("/?")) {
+        let html = fs::read_to_string(report_path).unwrap_or_else(|_| "<h1>报告未生成</h1>".into());
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            html.len(), html
+        );
+        stream.write_all(resp.as_bytes())?;
+    } else if method == "POST" && path.starts_with("/delete/") {
+        let idx: usize = path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        let result = (|| -> Result<String> {
+            let map = delmap.lock().unwrap();
+            let Some((tool, target)) = map.get(idx) else {
+                anyhow::bail!("无效索引 {}", idx);
+            };
+            if target.is_empty() {
+                anyhow::bail!("该条目({})不支持删除（记录在数据库/加密库内）", tool);
+            }
+            trash_target(tool, target)
+        })();
+        // 删除后重建报告（保持页面与磁盘一致）
+        if result.is_ok() {
+            let _ = run_build();
+        }
+        let body = match result {
+            Ok(dest) => format!("{{\"ok\":true,\"recycle\":\"{}\"}}", dest.replace('\\', "/")),
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", esc(&e.to_string())),
+        };
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        stream.write_all(resp.as_bytes())?;
+    } else {
+        let body = "{\"ok\":false,\"error\":\"not found\"}";
+        let resp = format!(
+            "HTTP/1.1 404 NOT FOUND\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        stream.write_all(resp.as_bytes())?;
+    }
     Ok(())
 }

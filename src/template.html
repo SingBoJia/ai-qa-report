@@ -26,8 +26,13 @@ tr:hover td{background:#171b28}
 .w{max-width:520px}
 .d{color:#6b7280;font-size:11px;margin-top:3px}
 .f{color:#67e8f9;font-size:11px;word-break:break-all;max-width:260px;font-family:Consolas,monospace}
+.delc{width:30px;text-align:center}
+.del{background:none;border:1px solid #4b2230;color:#f87171;border-radius:6px;cursor:pointer;font-size:12px;padding:2px 7px}
+.del:hover{background:#7f1d1d;color:#fff}
+.del.bound{border-color:#f87171}
 .foot{margin-top:20px;color:#6b7280;font-size:12px;line-height:1.8}
 .showing{color:#9ca3af;font-size:12px;margin-bottom:8px}
+.note-del{color:#fbbf24;font-size:12px;margin-bottom:12px}
 @media(max-width:800px){.t,.f{display:none}}
 </style></head><body><div class="wrap">
 <h1>🖥️ 电脑 AI 问答记录梳理报告</h1>
@@ -35,8 +40,9 @@ tr:hover td{background:#171b28}
 <div class="cards">__CARDS__</div>
 <div class="chips">__CHIPS__</div>
 <input id="q" placeholder="🔍 搜索关键词（标题/目录）…" oninput="search()">
+<div class="note-del" id="delnote" style="display:none">🗑 删除模式已启用（本地服务）：点行尾 ✕ 删除 = 移入回收目录，可手动恢复。文件型会话（Codex/Claude/豆包/Antigravity/WorkBuddy）可删；数据库型（ZCode/LobsterAI）不可删。</div>
 <div class="showing" id="cnt"></div>
-<table><thead><tr><th>时间</th><th>工具</th><th>做了啥</th><th>记录所在文件夹</th></tr></thead>
+<table><thead><tr><th>时间</th><th>工具</th><th>做了啥</th><th>记录所在文件夹</th><th></th></tr></thead>
 <tbody id="tb">
 __ROWS__
 </tbody></table>
@@ -52,11 +58,25 @@ __ROWS__
 摘要规则：取每个会话<b>首条用户消息</b>作为"做了啥"；hi/hello/你是什么模型类测试会话、同一工具内首条消息完全相同的重复会话、系统自动注入的 agent history 任务已剔除（共 __REMOVED__ 条）。
 </div></div>
 <script>
+var SERVE_MODE = location.port !== '';
+if (SERVE_MODE) document.getElementById('delnote').style.display = 'block';
 function filt(t, el){document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active')});if(el)el.classList.add('active');
 document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=(!t||r.dataset.tool===t)?'':'none'});cnt()}
 function search(){var q=document.getElementById('q').value.toLowerCase();
 document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'});cnt()}
 function cnt(){var v=0;document.querySelectorAll('#tb tr').forEach(function(r){if(r.style.display!=='none')v++});
 document.getElementById('cnt').textContent='显示 '+v+' / __TOTAL__ 条'}
+async function delRow(idx, btn){
+  if(!SERVE_MODE){alert('删除功能需要本地服务模式：运行 ai-qa-report.exe serve 后从 http://127.0.0.1:8765 打开');return}
+  if(!confirm('确定删除这条会话记录？\\n（移入回收目录，可手动恢复）'))return;
+  btn.disabled = true; btn.textContent = '…';
+  try{
+    const resp = await fetch('/delete/' + idx, {method:'POST'});
+    const j = await resp.json();
+    if(j.ok){ btn.closest('tr').style.opacity = .35; btn.textContent = '已删';
+      setTimeout(()=>location.reload(), 800);
+    } else { alert('删除失败: ' + (j.error||'未知')); btn.disabled=false; btn.textContent='✕'; }
+  }catch(e){ alert('请求失败: ' + e); btn.disabled=false; btn.textContent='✕'; }
+}
 cnt()
 </script></body></html>
