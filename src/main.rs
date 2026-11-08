@@ -1,10 +1,13 @@
 use anyhow::Result;
 use chrono::{DateTime, Local, TimeZone};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn home_dir() -> PathBuf {
     // Windows: %USERPROFILE%; Unix: $HOME; fallback to cargo-provided dir
@@ -88,8 +91,9 @@ fn load_zcode() -> Result<Vec<Row>> {
         return Ok(vec![]);
     }
     let con = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    con.busy_timeout(std::time::Duration::from_secs(3))?;
     let mut stmt = con.prepare(
-        "SELECT title, directory, time_created FROM session ORDER BY time_created",
+        "SELECT title, directory, time_created, id FROM session ORDER BY time_created",
     )?;
     let mut rows = vec![];
     let iter = stmt.query_map([], |r| {
@@ -97,17 +101,18 @@ fn load_zcode() -> Result<Vec<Row>> {
             r.get::<_, Option<String>>(0)?,
             r.get::<_, Option<String>>(1)?,
             r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
     for r in iter {
-        let (title, dir, ts) = r?;
+        let (title, dir, ts, sid) = r?;
         rows.push(Row {
             tool: "ZCode",
             time: ts.map(ms2str).unwrap_or_default(),
             what: summ(&title.unwrap_or_default()),
             folder: "~/.zcode/cli/db/db.sqlite".into(),
             detail: format!("工作目录: {}", dir.unwrap_or_else(|| "-".into())),
-            del_id: String::new(),
+            del_id: sid.map(|s| format!("db:zcode:{}", s)).unwrap_or_default(),
         });
     }
     Ok(rows)
@@ -538,7 +543,7 @@ fn load_workbuddy() -> Result<Vec<Row>> {
                 "(空会话/仅状态文件)".to_string()
             };
             rows.push(Row {
-                tool: Box::leak(tool.to_string().into_boxed_str()),
+                tool,
                 time: time_raw.chars().take(16).collect::<String>().replace('_', " "),
                 what: summ(&what),
                 folder: {
@@ -560,6 +565,7 @@ fn load_lobster() -> Result<Vec<Row>> {
         return Ok(vec![]);
     }
     let con = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    con.busy_timeout(std::time::Duration::from_secs(3))?;
     let mut stmt = con.prepare(
         "SELECT title, status, cwd, created_at, id FROM cowork_sessions ORDER BY created_at",
     )?;
@@ -585,7 +591,7 @@ fn load_lobster() -> Result<Vec<Row>> {
                 status.unwrap_or_else(|| "-".into()),
                 cwd.unwrap_or_else(|| "-".into())
             ),
-            del_id: id.unwrap_or_default(),
+            del_id: id.map(|i| format!("db:lobster:{}", i)).unwrap_or_default(),
         });
     }
     Ok(rows)
@@ -677,14 +683,29 @@ fn build_html(f: &Filtered) -> String {
             String::new()
         } else {
             format!(
-                "<button class=\"del\" onclick=\"delRow({},this)\" title=\"移入回收目录（可恢复）\">✕</button>",
+                "<button class=\"del\" onclick=\"delRow({},this)\" title=\"删除（移入回收目录/整库备份，可恢复）\">✕</button>",
                 idx
             )
         };
+        let sel_box = if r.del_id.is_empty() {
+            String::new()
+        } else {
+            "<input type=\"checkbox\" class=\"sel\" onclick=\"syncSel()\">".to_string()
+        };
+        let open_btn = if r.del_id.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<button class=\"fo\" onclick=\"openFolder({},this)\" title=\"打开所在文件夹\">📂</button>",
+                idx
+            )
+        };
+        // 行内容校验键：tool+del_id 整行，供 serve 端与 delmap.tsv 比对，防止重建后行号错位删错
+        let rowkey = esc(&format!("{}\t{}", r.tool, r.del_id));
         trs.push_str(&format!(
-            "<tr data-tool=\"{}\" data-idx=\"{}\"><td class=\"t\">{}</td><td><span class=\"badge\" style=\"background:{}\">{}</span></td><td class=\"w\">{}<div class=\"d\">{}</div></td><td class=\"f\">{}</td><td class=\"delc\">{}</td></tr>\n",
-            esc(r.tool), idx, esc(&r.time[..r.time.len().min(16)]), color, esc(r.tool),
-            esc(&r.what), esc(&r.detail), esc(&r.folder), del_btn
+            "<tr data-tool=\"{}\" data-k=\"{}\"><td class=\"chk\">{}</td><td class=\"t\">{}</td><td><span class=\"badge\" style=\"background:{}\">{}</span></td><td class=\"w\">{}<div class=\"d\">{}</div></td><td class=\"f\">{}</td><td class=\"delc\">{}</td></tr>\n",
+            esc(r.tool), rowkey, sel_box, esc(r.time.get(..16).unwrap_or(&r.time)), color, esc(r.tool),
+            esc(&r.what), esc(&r.detail), esc(&r.folder), format!("{}{}", open_btn, del_btn)
         ));
     }
 
@@ -714,21 +735,49 @@ fn build_html(f: &Filtered) -> String {
         .replace("__AUTO__", &f.n_auto.to_string())
         .replace("__REMOVED__", &(f.n_trivial + f.n_dupe + f.n_auto).to_string())
         .replace("__GENTIME__", &Local::now().format("%Y-%m-%d").to_string())
+        .replace("__VERSION__", VERSION)
 }
 
 fn main() -> Result<()> {
-    // serve 模式: ai-qa-report.exe serve [port]  → 启动本地服务，页面删除按钮可用
+    // ai-qa-report.exe [--version|version] | serve [port] | (默认) 生成报告
     let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 2 && (args[1] == "--version" || args[1] == "-V" || args[1] == "version") {
+        println!("ai-qa-report v{} (rust)", VERSION);
+        println!("v0.1 首版提取 | v0.2 过滤测试/重复会话 | v0.3 体积优化+计划任务 | v0.4 Antigravity标题解密索引+serve删除模式 | v0.5 ZCode/LobsterAI数据库会话可删除+整库备份+删除行号校验修复");
+        println!("v0.6 批量删除+勾选模式 | 回收站页面 /recycle | 一键恢复（文件回原位 / 数据库按快照回插）| 每条删除写 manifest.json");
+        println!("v0.6.1 删除时目标已被应用清理不再报失败，按“跳过”处理并自动刷新列表");
+        println!("v0.6.2 回收目录按“毫秒+序号+原名”唯一命名，同一批删除不再合并到同一文件夹");
+        println!("v0.7.0 回收站支持“清空”：移入 Windows 系统回收站（仍可恢复，不做不可逆删除）");
+        println!("v0.7.1 清空改用页面内确认框，避免内嵌浏览器拦截 prompt 导致点击无反应");
+        println!("v0.8.0 多端：Windows x86 构建 | macOS 清空移入 ~/.Trash | Linux 清空走 gio trash / trash-put");
+        println!("v0.9.0 报告分页（50/100/200 可选）| 每行“打开所在文件夹”（资源管理器/Finder/xdg-open）");
+        println!("v0.9.1 分页档位改为 10/20/30/50/100/200（默认 50）");
+        println!("v0.9.2 回收站每行可单独删除（移入系统回收站，可恢复）");
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "restore" {
+        let name = args.get(2).ok_or_else(|| {
+            anyhow::anyhow!("用法: ai-qa-report.exe restore <回收条目名>（条目名见 serve 模式 /recycle 页面）")
+        })?;
+        let restored = restore_entry(name)?;
+        println!("已恢复: {}", restored);
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "recycle" {
+        println!("{}", recycle_root().display());
+        return Ok(());
+    }
     if args.len() >= 2 && args[1] == "serve" {
         let port: u16 = args.get(2).map(|p| p.parse().unwrap_or(8765)).unwrap_or(8765);
         return serve(port);
     }
     run_build()?;
-    // 构建后自动以 serve 模式拉起本地服务（后台不阻塞由用户决定）
+    println!("提示: 需要页面内删除/恢复时，运行 ai-qa-report.exe serve，再打开 http://127.0.0.1:8765");
     Ok(())
 }
 
 fn run_build() -> Result<()> {
+    println!("ai-qa-report v{}", VERSION);
     println!("[1/4] 扫描数据源…");
     let mut all = vec![];
     all.extend(load_zcode().unwrap_or_else(|e| { eprintln!("  zcode 失败: {e}"); vec![] }));
@@ -762,11 +811,15 @@ fn run_build() -> Result<()> {
     Ok(())
 }
 
-// ---------- 删除：把目标移入回收目录（不真删，可恢复） ----------
+// ---------- 删除：文件型移入回收目录；数据库型走 trash_db（均可恢复） ----------
 fn trash_target(tool: &str, target: &str) -> Result<String> {
+    if let Some(spec) = target.strip_prefix("db:") {
+        return trash_db(tool, spec);
+    }
     let p = PathBuf::from(target);
     if !p.exists() {
-        anyhow::bail!("目标不存在: {}", target);
+        // 扫描后、点击前被应用自己清掉的会话：按“已失效”处理，由调用方刷新列表，不算失败
+        return Ok(String::new());
     }
     // 安全: 只允许删已知数据源前缀下的路径
     let hd = home_dir().to_string_lossy().replace('\\', "/");
@@ -783,11 +836,13 @@ fn trash_target(tool: &str, target: &str) -> Result<String> {
     if !allowed.iter().any(|a| norm.starts_with(a.as_str())) {
         anyhow::bail!("路径不在允许的数据源目录内，拒绝删除");
     }
-    let stamp = Local::now().format("%Y%m%d-%H%M%S");
-    let dest_dir = out_dir().join("recycle").join(format!("{}-{}", tool.replace(' ', "_"), stamp));
+    let dest_dir = out_dir()
+        .join("recycle")
+        .join(format!("{}-{}", tool.replace(' ', "_"), unique_suffix(&p)));
     fs::create_dir_all(&dest_dir)?;
     let dest = dest_dir.join(p.file_name().unwrap_or_default());
-    if p.is_dir() {
+    let is_dir = p.is_dir();
+    if is_dir {
         fs_extra_like_move_dir(&p, &dest)?;
     } else {
         fs::rename(&p, &dest).or_else(|_| {
@@ -795,7 +850,173 @@ fn trash_target(tool: &str, target: &str) -> Result<String> {
             fs::remove_file(&p)
         })?;
     }
-    // Antigravity: 同时清掉摘要索引里的记录由应用自行处理；这里额外备份摘要文件
+    write_manifest(&dest_dir, tool, if is_dir { "dir" } else { "file" }, target, None, None)?;
+    Ok(dest_dir.to_string_lossy().to_string())
+}
+
+// ---------- 打开所在文件夹：Explorer / Finder / xdg-open ----------
+fn reveal_target(tool: &str, target: &str) -> Result<String> {
+    if let Some(spec) = target.strip_prefix("db:") {
+        let Some((kind, _id)) = spec.split_once(':') else {
+            anyhow::bail!("无效的数据库目标: {}", spec);
+        };
+        let db = match kind {
+            "zcode" => format!("{}/.zcode/cli/db/db.sqlite", home_dir().display()),
+            "lobster" => format!(
+                "{}/AppData/Roaming/LobsterAI/lobsterai.sqlite",
+                home_dir().display()
+            ),
+            _ => anyhow::bail!("未知的数据库类型: {}", kind),
+        };
+        if !Path::new(&db).exists() {
+            anyhow::bail!("数据库不存在: {}", db);
+        }
+        open_in_file_manager(Path::new(&db), false)?;
+        return Ok(db);
+    }
+    let p = PathBuf::from(target);
+    if !p.exists() {
+        anyhow::bail!("目标不存在（可能已被删除或应用清理）");
+    }
+    // 与删除同样的白名单：只允许已知数据源目录
+    let hd = home_dir().to_string_lossy().replace('\\', "/");
+    let norm = target.replace('\\', "/");
+    let allowed = [
+        format!("{}/.claude/projects/", hd),
+        format!("{}/.codex/sessions/", hd),
+        format!("{}/.codex/archived_sessions/", hd),
+        format!("{}/Doubao/chats/", hd),
+        format!("{}/.gemini/antigravity/conversations/", hd),
+        format!("{}/WorkBuddy/", hd),
+        format!("{}/WorkBuddy AI/", hd),
+    ];
+    if !allowed.iter().any(|a| norm.starts_with(a.as_str())) {
+        anyhow::bail!("路径不在允许的数据源目录内，拒绝打开");
+    }
+    let is_dir = p.is_dir();
+    open_in_file_manager(&p, is_dir)?;
+    let _ = tool;
+    Ok(target.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn open_in_file_manager(path: &Path, is_dir: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("explorer.exe");
+    if is_dir {
+        cmd.arg(path);
+    } else {
+        cmd.arg("/select,").arg(path);
+    }
+    cmd.spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_file_manager(path: &Path, is_dir: bool) -> Result<()> {
+    let mut cmd = std::process::Command::new("open");
+    if !is_dir {
+        cmd.arg("-R");
+    }
+    cmd.arg(path).spawn()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_in_file_manager(path: &Path, is_dir: bool) -> Result<()> {
+    let target = if is_dir {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    std::process::Command::new("xdg-open").arg(target).spawn()?;
+    Ok(())
+}
+
+// ---------- 数据库会话删除：先整库备份到回收目录，再按 id 删行（外键级联清理子表） ----------
+fn trash_db(tool: &str, spec: &str) -> Result<String> {
+    let Some((kind, id)) = spec.split_once(':') else {
+        anyhow::bail!("无效的数据库删除目标: {}", spec);
+    };
+    if id.is_empty() {
+        anyhow::bail!("数据库删除目标缺少会话 id");
+    }
+    let (db_path, db_label) = match kind {
+        "zcode" => (format!("{}/.zcode/cli/db/db.sqlite", home_dir().display()), "db.sqlite"),
+        "lobster" => (
+            format!("{}/AppData/Roaming/LobsterAI/lobsterai.sqlite", home_dir().display()),
+            "lobsterai.sqlite",
+        ),
+        _ => anyhow::bail!("未知的数据库类型: {}", kind),
+    };
+    if !Path::new(&db_path).exists() {
+        anyhow::bail!("数据库不存在: {}", db_path);
+    }
+    // 0) id 消毒（防路径拼接注入）+ 先确认会话存在，避免无谓的大库备份
+    if id.contains('/') || id.contains('\\') || id.contains("..") || id.chars().any(|c| c.is_control()) {
+        anyhow::bail!("非法的会话 id");
+    }
+    let tbl = if kind == "zcode" { "session" } else { "cowork_sessions" };
+    let con_chk = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    con_chk.busy_timeout(std::time::Duration::from_secs(3))?;
+    let exists: i64 = con_chk.query_row(
+        &format!("SELECT COUNT(*) FROM {} WHERE id = ?1", tbl),
+        params![id],
+        |r| r.get(0),
+    )?;
+    drop(con_chk);
+    if exists == 0 {
+        // 会话已被应用删除（或上一次删除已生效）：按“已失效”处理
+        return Ok(String::new());
+    }
+    // 1) 一致性快照备份到回收目录（VACUUM INTO 事务级一致且压缩，源库写入中也可安全备份）
+    let stamp = Local::now().format("%Y%m%d-%H%M%S-%3f");
+    let dest_dir = out_dir().join("recycle").join(format!("{}-{}-{}", tool.replace(' ', "_"), stamp, id));
+    fs::create_dir_all(&dest_dir)?;
+    let snap = dest_dir.join(db_label);
+    let con_bk = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    con_bk.busy_timeout(std::time::Duration::from_secs(3))?;
+    con_bk.execute("VACUUM INTO ?1", params![snap.to_string_lossy().to_string()])?;
+    drop(con_bk);
+    // 2) 删行（事务）：session/cowork_sessions 主表删除后子表由外键级联清理；
+    //    无外键的 input_history、dwf_run（ZCode）/scheduled_task_runs、im_session_mappings（LobsterAI）显式删除
+    let con = Connection::open(&db_path)?;
+    con.busy_timeout(std::time::Duration::from_secs(3))?;
+    con.pragma_update(None, "foreign_keys", "ON")?;
+    con.execute_batch("BEGIN IMMEDIATE")?;
+    let del_result = (|| -> Result<usize> {
+        let n = match kind {
+            "zcode" => {
+                let n = con.execute("DELETE FROM session WHERE id = ?1", params![id])?;
+                con.execute("DELETE FROM input_history WHERE session_id = ?1", params![id])?;
+                con.execute("DELETE FROM dwf_run WHERE parent_session_id = ?1", params![id])?;
+                n
+            }
+            "lobster" => {
+                let n = con.execute("DELETE FROM cowork_sessions WHERE id = ?1", params![id])?;
+                con.execute("DELETE FROM scheduled_task_runs WHERE session_id = ?1", params![id])?;
+                con.execute("DELETE FROM im_session_mappings WHERE cowork_session_id = ?1", params![id])?;
+                n
+            }
+            _ => unreachable!(),
+        };
+        Ok(n)
+    })();
+    match del_result {
+        Ok(n) => {
+            con.execute_batch("COMMIT")?;
+            if n == 0 {
+                anyhow::bail!("会话不存在或已被删除: {}", id);
+            }
+        }
+        Err(e) => {
+            let _ = con.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+    // 注意：manifest 里存裸 id（不含 "zcode:"/"lobster:" 前缀），恢复时直接按 id 回插
+    write_manifest(&dest_dir, tool, "db", id, Some(kind), Some(db_label))?;
     Ok(dest_dir.to_string_lossy().to_string())
 }
 
@@ -819,95 +1040,819 @@ fn fs_extra_like_move_dir(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---------- 回收目录 / manifest / 恢复 ----------
+static TRASH_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+fn unique_suffix(p: &Path) -> String {
+    let n = TRASH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect();
+    format!("{}-{:03}-{}", Local::now().format("%Y%m%d-%H%M%S-%3f"), n, safe)
+}
+
+fn recycle_root() -> PathBuf {
+    out_dir().join("recycle")
+}
+
+fn write_manifest(
+    dir: &Path,
+    tool: &str,
+    kind: &str,
+    target: &str,
+    db: Option<&str>,
+    snapshot: Option<&str>,
+) -> Result<()> {
+    let created = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let opt = |v: Option<&str>| match v {
+        Some(s) => format!("\"{}\"", json_esc(s)),
+        None => "null".to_string(),
+    };
+    let json = format!(
+        "{{\n  \"tool\": \"{}\",\n  \"kind\": \"{}\",\n  \"target\": \"{}\",\n  \"db\": {},\n  \"snapshot\": {},\n  \"created\": \"{}\",\n  \"restored\": false\n}}\n",
+        json_esc(tool),
+        json_esc(kind),
+        json_esc(target),
+        opt(db),
+        opt(snapshot),
+        created
+    );
+    fs::write(dir.join("manifest.json"), json)?;
+    Ok(())
+}
+
+fn restore_entry(name: &str) -> Result<String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(|c| c.is_control())
+    {
+        anyhow::bail!("非法的回收条目名");
+    }
+    let dir = recycle_root().join(name);
+    let mp = dir.join("manifest.json");
+    if !mp.exists() {
+        anyhow::bail!("找不到回收条目: {}", name);
+    }
+    let txt = fs::read_to_string(&mp)?;
+    let mut v: Value = serde_json::from_str(&txt)?;
+    if v.get("restored").and_then(|b| b.as_bool()).unwrap_or(false) {
+        anyhow::bail!("该条目已恢复过");
+    }
+    let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let target = v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if target.is_empty() {
+        anyhow::bail!("manifest 缺少原始路径");
+    }
+    match kind.as_str() {
+        "file" | "dir" => {
+            let file_name = Path::new(&target)
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("无法解析原始文件名"))?;
+            let src = dir.join(file_name);
+            if !src.exists() {
+                anyhow::bail!("回收目录里找不到被移走的文件/目录");
+            }
+            let dst = PathBuf::from(&target);
+            if dst.exists() {
+                anyhow::bail!("原位置已存在同名文件，未覆盖: {}", target);
+            }
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::rename(&src, &dst)?;
+        }
+        "db" => {
+            let db = v.get("db").and_then(|x| x.as_str()).unwrap_or("");
+            let snap_name = v.get("snapshot").and_then(|x| x.as_str()).unwrap_or("");
+            if snap_name.is_empty() {
+                anyhow::bail!("manifest 缺少数据库快照名");
+            }
+            restore_db_row(db, &target, &dir.join(snap_name))?;
+        }
+        _ => anyhow::bail!("未知的回收条目类型: {}", kind),
+    }
+    v["restored"] = Value::Bool(true);
+    fs::write(&mp, serde_json::to_string_pretty(&v)?)?;
+    Ok(target)
+}
+
+fn restore_db_row(db_kind: &str, spec: &str, snap: &Path) -> Result<()> {
+    if !snap.exists() {
+        anyhow::bail!("数据库快照不存在: {}", snap.display());
+    }
+    let (db_path, main_tbl, children): (String, &str, &[(&str, &str)]) = match db_kind {
+        "zcode" => (
+            format!("{}/.zcode/cli/db/db.sqlite", home_dir().display()),
+            "session",
+            &[
+                ("input_history", "session_id"),
+                ("dwf_run", "parent_session_id"),
+            ],
+        ),
+        "lobster" => (
+            format!("{}/AppData/Roaming/LobsterAI/lobsterai.sqlite", home_dir().display()),
+            "cowork_sessions",
+            &[
+                ("cowork_messages", "session_id"),
+                ("scheduled_task_runs", "session_id"),
+                ("im_session_mappings", "cowork_session_id"),
+            ],
+        ),
+        _ => anyhow::bail!("未知的数据库类型: {}", db_kind),
+    };
+    if !Path::new(&db_path).exists() {
+        anyhow::bail!("数据库不存在: {}", db_path);
+    }
+    let con = Connection::open(&db_path)?;
+    con.busy_timeout(std::time::Duration::from_secs(3))?;
+    con.pragma_update(None, "foreign_keys", "ON")?;
+    con.execute(
+        "ATTACH DATABASE ?1 AS bk",
+        params![snap.to_string_lossy().to_string()],
+    )?;
+    let exists: i64 = con.query_row(
+        &format!("SELECT COUNT(*) FROM {} WHERE id = ?1", main_tbl),
+        params![spec],
+        |r| r.get(0),
+    )?;
+    if exists > 0 {
+        let _ = con.execute_batch("DETACH DATABASE bk");
+        anyhow::bail!("目标会话已存在，未覆盖: {}", spec);
+    }
+    con.execute_batch("BEGIN IMMEDIATE")?;
+    let res = (|| -> Result<()> {
+        let inserted = con.execute(
+            &format!(
+                "INSERT OR REPLACE INTO main.{} SELECT * FROM bk.{} WHERE id = ?1",
+                main_tbl, main_tbl
+            ),
+            params![spec],
+        )?;
+        if inserted == 0 {
+            anyhow::bail!("快照中没有该会话，无法恢复: {}", spec);
+        }
+        for (tbl, key) in children {
+            let in_snap: i64 = con.query_row(
+                "SELECT COUNT(*) FROM bk.sqlite_master WHERE type='table' AND name=?1",
+                params![tbl],
+                |r| r.get(0),
+            )?;
+            if in_snap > 0 {
+                con.execute(
+                    &format!(
+                        "INSERT OR REPLACE INTO main.{} SELECT * FROM bk.{} WHERE {} = ?1",
+                        tbl, tbl, key
+                    ),
+                    params![spec],
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            con.execute_batch("COMMIT")?;
+            let _ = con.execute_batch("DETACH DATABASE bk");
+            Ok(())
+        }
+        Err(e) => {
+            let _ = con.execute_batch("ROLLBACK");
+            let _ = con.execute_batch("DETACH DATABASE bk");
+            Err(e)
+        }
+    }
+}
+
+fn recycle_page_html() -> String {
+    let root = recycle_root();
+    let mut items: Vec<(String, String, String, String, String, bool)> = vec![];
+    if let Ok(rd) = fs::read_dir(&root) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let Ok(txt) = fs::read_to_string(p.join("manifest.json")) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(&txt) else {
+                continue;
+            };
+            items.push((
+                e.file_name().to_string_lossy().to_string(),
+                v.get("created").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("tool").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("kind").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("target").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("restored").and_then(|x| x.as_bool()).unwrap_or(false),
+            ));
+        }
+    }
+    items.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut rows = String::new();
+    for (name, created, tool, kind, target, restored) in &items {
+        let status = if *restored {
+            "<span class=\"ok\">已恢复</span>".to_string()
+        } else {
+            format!(
+                "<button class=\"rs\" data-e=\"{n}\" onclick=\"restore(this)\">↩ 恢复</button><button class=\"pg\" data-e=\"{n}\" onclick=\"purgeEntry(this)\">🗑 删除</button>",
+                n = esc(name)
+            )
+        };
+        rows.push_str(&format!(
+            "<tr><td class=\"t\">{}</td><td>{}</td><td>{}</td><td class=\"f\">{}</td><td class=\"act\">{}</td></tr>\n",
+            esc(created),
+            esc(tool),
+            esc(kind),
+            esc(target),
+            status
+        ));
+    }
+    if rows.is_empty() {
+        rows.push_str("<tr><td colspan=\"5\" class=\"empty\">回收站是空的</td></tr>\n");
+    }
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>回收站 · ai-qa-report</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#0f1117;color:#e5e7eb;padding:32px 20px}}
+.wrap{{max-width:1100px;margin:0 auto}}
+h1{{font-size:24px;margin-bottom:6px}}
+.sub{{color:#9ca3af;font-size:13px;margin-bottom:20px}}
+a{{color:#67e8f9;text-decoration:none}}
+table{{width:100%;border-collapse:collapse;background:#12141c;border-radius:12px;overflow:hidden;border:1px solid #232838}}
+th{{background:#1a1e2b;text-align:left;padding:10px 12px;font-size:12px;color:#9ca3af}}
+td{{padding:9px 12px;border-top:1px solid #1d2230;font-size:13px;vertical-align:top}}
+.t{{white-space:nowrap;color:#9ca3af;font-size:12px}}
+.f{{color:#67e8f9;font-size:12px;word-break:break-all;font-family:Consolas,monospace}}
+.act{{width:90px;text-align:center}}
+.rs{{background:#14532d;border:1px solid #22c55e;color:#bbf7d0;border-radius:6px;cursor:pointer;font-size:12px;padding:3px 10px}}
+.rs:hover{{background:#166534;color:#fff}}
+.pg{{background:#3f1d1d;border:1px solid #f87171;color:#fecaca;border-radius:6px;cursor:pointer;font-size:12px;padding:3px 10px;margin-left:6px}}
+.pg:hover{{background:#7f1d1d;color:#fff}}
+.ok{{color:#22c55e;font-size:12px}}
+.empty{{text-align:center;color:#6b7280;padding:24px}}
+.clr{{background:#3f1d1d;border:1px solid #f87171;color:#fecaca;border-radius:8px;padding:5px 12px;cursor:pointer;font-size:12px;margin-left:10px}}
+.clr:hover{{background:#7f1d1d;color:#fff}}
+.mask{{position:fixed;inset:0;background:rgba(0,0,0,.62);display:none;align-items:center;justify-content:center;z-index:9}}
+.mask.on{{display:flex}}
+.dlg{{background:#171a23;border:1px solid #2a3040;border-radius:12px;padding:20px;width:380px;max-width:92vw}}
+.dt{{font-size:16px;margin-bottom:8px;color:#fff}}
+.dd{{color:#9ca3af;font-size:12px;line-height:1.7;margin-bottom:10px}}
+.dd b{{color:#fca5a5}}
+#cf{{width:100%;padding:8px 10px;border-radius:8px;border:1px solid #2a3040;background:#0f1117;color:#e5e7eb;margin-bottom:8px;font-size:13px}}
+.dmsg{{color:#fbbf24;font-size:12px;min-height:16px;margin-bottom:10px}}
+.dbtns{{display:flex;gap:10px;justify-content:flex-end}}
+.dbtns .rs,.dbtns .clr{{margin-left:0}}
+.foot{{margin-top:16px;color:#6b7280;font-size:12px;line-height:1.8}}
+</style></head><body><div class="wrap">
+<h1>🗑 回收站</h1>
+<div class="sub">共 {} 条删除记录 ｜ 目录：{} ｜ <a href="/">← 返回报告</a><button class="clr" onclick="clearAll()">清空回收站</button></div>
+<table><thead><tr><th>删除时间</th><th>工具</th><th>类型</th><th>原始位置</th><th>操作</th></tr></thead>
+<tbody>{}</tbody></table>
+<div class="foot">文件型会话：恢复 = 从回收目录移回原位置，不覆盖已存在的同名文件。<br>
+数据库型（ZCode/LobsterAI）：恢复 = 从整库快照中把该会话及其子表记录插回数据库；已存在同 id 时会拒绝覆盖。<br>
+单行“删除”或“清空”= 移入<b>系统回收站/废纸篓</b>（仍可恢复），本工具不做不可逆删除。</div>
+<div class="mask" id="mask">
+  <div class="dlg">
+    <div class="dt">清空回收站</div>
+    <div class="dd">所有条目会移入 Windows 系统回收站（仍可恢复）。<br>请输入 <b>清空</b> 两个字确认：</div>
+    <input id="cf" placeholder="输入 清空" autocomplete="off">
+    <div class="dmsg" id="dmsg"></div>
+    <div class="dbtns">
+      <button class="rs" onclick="hideClear()">取消</button>
+      <button class="clr" onclick="doClear()">确认清空</button>
+    </div>
+  </div>
+</div>
+</div>
+<script>
+async function restore(btn){{
+  var e=btn.dataset.e;
+  if(!confirm('恢复 '+e+' ？'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{{
+    var r=await fetch('/restore/'+encodeURIComponent(e),{{method:'POST'}});
+    var j=await r.json();
+    if(j.ok){{location.reload();}}else{{alert('恢复失败: '+(j.error||'未知'));btn.disabled=false;btn.textContent='↩ 恢复';}}
+  }}catch(err){{alert('请求失败: '+err);btn.disabled=false;btn.textContent='↩ 恢复';}}
+}}
+function clearAll(){{
+  var cf=document.getElementById('cf');
+  cf.value='';
+  document.getElementById('dmsg').textContent='';
+  document.getElementById('mask').classList.add('on');
+  cf.focus();
+}}
+function hideClear(){{
+  document.getElementById('mask').classList.remove('on');
+}}
+async function doClear(){{
+  var v=document.getElementById('cf').value.trim();
+  if(v!=='清空'){{
+    document.getElementById('dmsg').textContent='请输入“清空”两个字';
+    return;
+  }}
+  document.getElementById('dmsg').textContent='正在移入系统回收站…';
+  try{{
+    var r=await fetch('/clear',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{confirm:'清空'}})}});
+    var j=await r.json();
+    if(j.ok){{
+      var msg='已移入系统回收站 '+j.moved+' 项';
+      if(j.errors&&j.errors.length)msg+='，失败 '+j.errors.length+' 项：'+j.errors.slice(0,6).join('；');
+      document.getElementById('dmsg').textContent=msg+'，正在刷新…';
+      setTimeout(function(){{location.reload()}},800);
+    }}else{{
+      document.getElementById('dmsg').textContent='清空失败: '+(j.error||'未知');
+    }}
+  }}catch(e){{
+    document.getElementById('dmsg').textContent='请求失败: '+e;
+  }}
+}}
+function purgeEntry(btn){{
+  if(!btn.dataset.armed){{
+    btn.dataset.armed='1';
+    btn.textContent='确认删除?';
+    setTimeout(function(){{
+      if(!btn.disabled){{ btn.dataset.armed=''; btn.textContent='🗑 删除'; }}
+    }},3000);
+    return;
+  }}
+  btn.disabled=true;
+  btn.textContent='…';
+  fetch('/purge/'+encodeURIComponent(btn.dataset.e),{{method:'POST'}})
+    .then(function(r){{ return r.json(); }})
+    .then(function(j){{
+      if(j.ok){{ location.reload(); }}
+      else {{ alert('删除失败: '+(j.error||'未知')); btn.disabled=false; btn.textContent='🗑 删除'; }}
+    }})
+    .catch(function(e){{
+      alert('请求失败: '+e); btn.disabled=false; btn.textContent='🗑 删除';
+    }});
+}}
+</script></body></html>"#,
+        items.len(),
+        esc(&root.to_string_lossy()),
+        rows
+    )
+}
+
+// ---------- 清空回收站：移入 Windows 系统回收站（仍可恢复，不做不可逆删除） ----------
+fn purge_entry(name: &str) -> Result<String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name.chars().any(|c| c.is_control())
+    {
+        anyhow::bail!("非法的回收条目名");
+    }
+    let dir = recycle_root().join(name);
+    if !dir.exists() {
+        anyhow::bail!("回收条目不存在: {}", name);
+    }
+    send_to_os_recycle(&dir)?;
+    Ok(name.to_string())
+}
+
+fn clear_recycle() -> Result<(usize, Vec<String>)> {
+    let root = recycle_root();
+    let mut moved = 0usize;
+    let mut errors: Vec<String> = vec![];
+    if !root.exists() {
+        return Ok((0, errors));
+    }
+    for e in fs::read_dir(&root)? {
+        let e = e?;
+        let p = e.path();
+        match send_to_os_recycle(&p) {
+            Ok(()) => moved += 1,
+            Err(err) => errors.push(format!(
+                "{}: {}",
+                e.file_name().to_string_lossy(),
+                err
+            )),
+        }
+    }
+    Ok((moved, errors))
+}
+
+#[cfg(target_os = "windows")]
+fn send_to_os_recycle(path: &Path) -> Result<()> {
+    let p = path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName Microsoft.VisualBasic; $p='{p}'; if (Test-Path -LiteralPath $p) {{ if ((Get-Item -LiteralPath $p).PSIsContainer) {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($p,'OnlyErrorDialogs','SendToRecycleBin') }} else {{ [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($p,'OnlyErrorDialogs','SendToRecycleBin') }} }}"
+    );
+    let out = std::process::Command::new("powershell.exe")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(&script)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "移入系统回收站失败: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn send_to_os_recycle(path: &Path) -> Result<()> {
+    let trash = home_dir().join(".Trash");
+    fs::create_dir_all(&trash)?;
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ai-qa-report-item".into());
+    let mut dest = trash.join(&name);
+    if dest.exists() {
+        dest = trash.join(format!(
+            "{}-{}",
+            name,
+            Local::now().format("%Y%m%d-%H%M%S")
+        ));
+    }
+    fs::rename(path, &dest)
+        .map_err(|e| anyhow::anyhow!("移入 ~/.Trash 失败: {}", e))?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn send_to_os_recycle(path: &Path) -> Result<()> {
+    if let Ok(out) = std::process::Command::new("gio")
+        .arg("trash")
+        .arg("--")
+        .arg(path)
+        .output()
+    {
+        if out.status.success() {
+            return Ok(());
+        }
+    }
+    match std::process::Command::new("trash-put").arg(path).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => anyhow::bail!(
+            "移入系统回收站失败（gio/trash-put）: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(_) => anyhow::bail!("未找到 gio 或 trash-put，无法移入系统回收站"),
+    }
+}
+
 // ---------- serve 模式：极简 HTTP（std only, 无依赖） ----------
 use std::io::{Write as IoWrite};
 use std::net::{TcpListener, TcpStream};
 
 fn serve(port: u16) -> Result<()> {
     run_build()?;
-    let delmap_raw = fs::read_to_string(out_dir().join("delmap.tsv")).unwrap_or_default();
-    let delmap: Vec<(String, String)> = delmap_raw
-        .lines()
-        .map(|l| {
-            let mut it = l.splitn(2, '\t');
-            (it.next().unwrap_or("").to_string(), it.next().unwrap_or("").to_string())
-        })
-        .collect();
     let report_path = std::sync::Arc::new(out_dir().join("AI问答记录梳理报告.html"));
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     println!("服务已启动: http://127.0.0.1:{} （Ctrl+C 停止）", port);
     println!("页面删除按钮可用；删除 = 移入 {} (可恢复)", out_dir().join("recycle").display());
 
-    let delmap = std::sync::Arc::new(std::sync::Mutex::new(delmap));
-    let report_path_c = report_path.clone();
+    let build_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let build_lock_c = build_lock.clone();
     std::thread::spawn(move || {
         // 每 60s 重建一次报告，让删除后其他打开的页面也保持最新
         loop {
             std::thread::sleep(std::time::Duration::from_secs(60));
+            let _g = build_lock_c.lock().unwrap();
             let _ = run_build();
         }
     });
-    let _ = report_path_c;
     for stream in listener.incoming() {
         let mut stream = match stream { Ok(s) => s, Err(_) => continue };
-        let delmap = delmap.clone();
+        let build_lock = build_lock.clone();
         let report_path = report_path.clone();
         std::thread::spawn(move || {
-            let _ = handle_conn(&mut stream, &delmap, &report_path);
+            let _ = handle_conn(&mut stream, &build_lock, &report_path);
         });
     }
     Ok(())
 }
 
-fn handle_conn(stream: &mut TcpStream, delmap: &std::sync::Mutex<Vec<(String, String)>>, report_path: &Path) -> Result<()> {
+fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+    let mut data: Vec<u8> = Vec::new();
     let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf)?;
-    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-    let first_line = req.lines().next().unwrap_or("");
+    loop {
+        let n = stream.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&buf[..n]);
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&data[..pos]).to_string();
+            let mut need = 0usize;
+            for line in head.lines().skip(1) {
+                let ll = line.to_ascii_lowercase();
+                if let Some(v) = ll.strip_prefix("content-length:") {
+                    need = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if data.len() >= pos + 4 + need {
+                break;
+            }
+        }
+        if data.len() > 4 * 1024 * 1024 {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&data).to_string())
+}
+
+fn respond(stream: &mut TcpStream, status: &str, ctype: &str, body: &str) -> Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n\r\n{}",
+        status,
+        ctype,
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes())?;
+    Ok(())
+}
+
+fn handle_conn(stream: &mut TcpStream, build_lock: &std::sync::Mutex<()>, report_path: &Path) -> Result<()> {
+    let req = read_http_request(stream)?;
+    let (head, body) = req.split_once("\r\n\r\n").unwrap_or((req.as_str(), ""));
+    let first_line = head.lines().next().unwrap_or("");
     let mut parts = first_line.split(' ');
     let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
 
+    // 本机 CSRF/DNS-rebinding 防护：Host 必须是 127.0.0.1/localhost，带 Origin 头时必须同源
+    let mut host_ok = false;
+    let mut origin_ok = true; // 无 Origin 头（直接访问/同源请求）视为通过
+    for line in head.lines().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let ll = line.to_ascii_lowercase();
+        if let Some(h) = ll.strip_prefix("host:") {
+            let h = h.trim();
+            host_ok = h.starts_with("127.0.0.1") || h.starts_with("localhost");
+        } else if let Some(o) = ll.strip_prefix("origin:") {
+            let o = o.trim();
+            origin_ok = o == "http://127.0.0.1" || o.starts_with("http://127.0.0.1:")
+                || o == "http://localhost" || o.starts_with("http://localhost:");
+        }
+    }
+    if !host_ok || !origin_ok {
+        return respond(
+            stream,
+            "403 FORBIDDEN",
+            "application/json; charset=utf-8",
+            "{\"ok\":false,\"error\":\"forbidden host/origin\"}",
+        );
+    }
+
     if method == "GET" && (path == "/" || path.starts_with("/?")) {
         let html = fs::read_to_string(report_path).unwrap_or_else(|_| "<h1>报告未生成</h1>".into());
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-            html.len(), html
+        return respond(stream, "200 OK", "text/html; charset=utf-8", &html);
+    }
+
+    if method == "GET" && path.starts_with("/recycle") {
+        return respond(
+            stream,
+            "200 OK",
+            "text/html; charset=utf-8",
+            &recycle_page_html(),
         );
-        stream.write_all(resp.as_bytes())?;
-    } else if method == "POST" && path.starts_with("/delete/") {
-        let idx: usize = path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
-        let result = (|| -> Result<String> {
-            let map = delmap.lock().unwrap();
-            let Some((tool, target)) = map.get(idx) else {
-                anyhow::bail!("无效索引 {}", idx);
-            };
-            if target.is_empty() {
-                anyhow::bail!("该条目({})不支持删除（记录在数据库/加密库内）", tool);
+    }
+
+    if method == "POST" && path.starts_with("/delete_batch") {
+        let keys: Vec<String> = serde_json::from_str(body).unwrap_or_default();
+        if keys.is_empty() {
+            return respond(
+                stream,
+                "200 OK",
+                "application/json; charset=utf-8",
+                "{\"ok\":true,\"deleted\":0,\"errors\":[]}",
+            );
+        }
+        let raw = fs::read_to_string(out_dir().join("delmap.tsv")).unwrap_or_default();
+        let lines: Vec<&str> = raw.lines().collect();
+        let (mut done, mut skipped, mut errors) = (0usize, 0usize, Vec::<String>::new());
+        for k in keys.iter().take(500) {
+            if let Some(line) = lines.iter().find(|l| **l == k.as_str()) {
+                let mut it = line.splitn(2, '\t');
+                let tool = it.next().unwrap_or("").to_string();
+                let target = it.next().unwrap_or("").to_string();
+                if target.is_empty() {
+                    errors.push(format!("{}: 不支持删除", tool));
+                    continue;
+                }
+                match trash_target(&tool, &target) {
+                    Ok(d) if d.is_empty() => skipped += 1,
+                    Ok(_) => done += 1,
+                    Err(e) => errors.push(format!("{}: {}", tool, e)),
+                }
+            } else {
+                let short: String = k.chars().take(70).collect();
+                errors.push(format!("未找到条目: {}", short));
             }
-            trash_target(tool, target)
-        })();
-        // 删除后重建报告（保持页面与磁盘一致）
-        if result.is_ok() {
+        }
+        if done > 0 || skipped > 0 {
+            let _g = build_lock.lock().unwrap();
             let _ = run_build();
         }
-        let body = match result {
-            Ok(dest) => format!("{{\"ok\":true,\"recycle\":\"{}\"}}", dest.replace('\\', "/")),
-            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", esc(&e.to_string())),
-        };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(), body
+        let err_json = errors
+            .iter()
+            .map(|e| format!("\"{}\"", json_esc(e)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let out = format!(
+            "{{\"ok\":true,\"deleted\":{},\"skipped\":{},\"errors\":[{}]}}",
+            done, skipped, err_json
         );
-        stream.write_all(resp.as_bytes())?;
-    } else {
-        let body = "{\"ok\":false,\"error\":\"not found\"}";
-        let resp = format!(
-            "HTTP/1.1 404 NOT FOUND\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(), body
-        );
-        stream.write_all(resp.as_bytes())?;
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
     }
-    Ok(())
+
+    if method == "POST" && path.starts_with("/delete/") {
+        // 每次请求重读 delmap.tsv（不缓存），并用页面携带的整行 key 校验行号，防重建后错位删错
+        let (ppath, query) = match path.split_once('?') {
+            Some((a, b)) => (a, b),
+            None => (path, ""),
+        };
+        let idx: usize = ppath.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+        let want_k = query.split('&').find_map(|kv| kv.strip_prefix("k=")).map(percent_decode);
+        let result = (|| -> Result<String> {
+            let raw = fs::read_to_string(out_dir().join("delmap.tsv")).unwrap_or_default();
+            let Some((tool, target)) = raw.lines().nth(idx).map(|l| {
+                let mut it = l.splitn(2, '\t');
+                (
+                    it.next().unwrap_or("").to_string(),
+                    it.next().unwrap_or("").to_string(),
+                )
+            }) else {
+                anyhow::bail!("无效索引 {}（列表可能已更新，请刷新页面）", idx);
+            };
+            match &want_k {
+                Some(k) if *k == format!("{}\t{}", tool, target) => {}
+                _ => anyhow::bail!("列表已更新，行号与内容不匹配；请刷新页面后重试"),
+            }
+            if target.is_empty() {
+                anyhow::bail!("该条目({})不支持删除", tool);
+            }
+            trash_target(&tool, &target)
+        })();
+        // 删除后重建报告（保持页面与磁盘一致；与 60s 定时重建互斥，防写坏文件）
+        if result.is_ok() {
+            let _g = build_lock.lock().unwrap();
+            let _ = run_build();
+        }
+        let out = match result {
+            Ok(dest) if dest.is_empty() => {
+                "{\"ok\":true,\"skipped\":true,\"note\":\"目标已不存在（可能已被应用清理），列表已刷新\"}".to_string()
+            }
+            Ok(dest) => format!("{{\"ok\":true,\"recycle\":\"{}\"}}", json_esc(&dest.replace('\\', "/"))),
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_esc(&e.to_string())),
+        };
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
+    }
+
+    if method == "POST" && path.starts_with("/reveal/") {
+        let (ppath, query) = match path.split_once('?') {
+            Some((a, b)) => (a, b),
+            None => (path, ""),
+        };
+        let idx: usize = ppath
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(usize::MAX);
+        let want_k = query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("k="))
+            .map(percent_decode);
+        let result = (|| -> Result<String> {
+            let raw = fs::read_to_string(out_dir().join("delmap.tsv")).unwrap_or_default();
+            let Some((tool, target)) = raw.lines().nth(idx).map(|l| {
+                let mut it = l.splitn(2, '\t');
+                (
+                    it.next().unwrap_or("").to_string(),
+                    it.next().unwrap_or("").to_string(),
+                )
+            }) else {
+                anyhow::bail!("无效索引 {}（列表可能已更新，请刷新页面）", idx);
+            };
+            match &want_k {
+                Some(k) if *k == format!("{}\t{}", tool, target) => {}
+                _ => anyhow::bail!("列表已更新，行号与内容不匹配；请刷新页面后重试"),
+            }
+            if target.is_empty() {
+                anyhow::bail!("该条目({})没有可打开的本地位置", tool);
+            }
+            reveal_target(&tool, &target)
+        })();
+        let out = match result {
+            Ok(p) => format!(
+                "{{\"ok\":true,\"path\":\"{}\"}}",
+                json_esc(&p.replace('\\', "/"))
+            ),
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_esc(&e.to_string())),
+        };
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
+    }
+
+    if method == "POST" && path.starts_with("/purge/") {
+        let entry = percent_decode(path.rsplit('/').next().unwrap_or(""));
+        let out = match purge_entry(&entry) {
+            Ok(n) => format!("{{\"ok\":true,\"purged\":\"{}\"}}", json_esc(&n)),
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_esc(&e.to_string())),
+        };
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
+    }
+
+    if method == "POST" && path.starts_with("/clear") {
+        if !body.contains("清空") {
+            return respond(
+                stream,
+                "400 BAD REQUEST",
+                "application/json; charset=utf-8",
+                "{\"ok\":false,\"error\":\"需要确认文本：清空\"}",
+            );
+        }
+        let out = match clear_recycle() {
+            Ok((moved, errors)) => {
+                let err_json = errors
+                    .iter()
+                    .map(|e| format!("\"{}\"", json_esc(e)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!("{{\"ok\":true,\"moved\":{},\"errors\":[{}]}}", moved, err_json)
+            }
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_esc(&e.to_string())),
+        };
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
+    }
+
+    if method == "POST" && path.starts_with("/restore/") {
+        let entry = percent_decode(path.rsplit('/').next().unwrap_or(""));
+        let out = match restore_entry(&entry) {
+            Ok(p) => format!("{{\"ok\":true,\"restored\":\"{}\"}}", json_esc(&p.replace('\\', "/"))),
+            Err(e) => format!("{{\"ok\":false,\"error\":\"{}\"}}", json_esc(&e.to_string())),
+        };
+        return respond(stream, "200 OK", "application/json; charset=utf-8", &out);
+    }
+
+    respond(
+        stream,
+        "404 NOT FOUND",
+        "application/json; charset=utf-8",
+        "{\"ok\":false,\"error\":\"not found\"}",
+    )
+}
+
+fn json_esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 3 <= b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
 }

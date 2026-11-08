@@ -30,19 +30,44 @@ tr:hover td{background:#171b28}
 .del{background:none;border:1px solid #4b2230;color:#f87171;border-radius:6px;cursor:pointer;font-size:12px;padding:2px 7px}
 .del:hover{background:#7f1d1d;color:#fff}
 .del.bound{border-color:#f87171}
+.fo{background:none;border:1px solid #1e3a5f;color:#7dd3fc;border-radius:6px;cursor:pointer;font-size:12px;padding:2px 7px;margin-right:4px}
+.fo:hover{background:#0c4a6e;color:#fff}
+.pager{display:flex;align-items:center;gap:10px;margin:0 0 10px;color:#9ca3af;font-size:12px}
+.pager button{background:#171a23;border:1px solid #2a3040;color:#e5e7eb;border-radius:6px;padding:4px 10px;cursor:pointer}
+.pager button:hover{border-color:#67e8f9}
+.pager select{background:#171a23;border:1px solid #2a3040;color:#e5e7eb;border-radius:6px;padding:3px 6px}
+.chk{width:28px;text-align:center}
+input.sel{accent-color:#22c55e;cursor:pointer;width:14px;height:14px}
+.bulk{display:flex;align-items:center;gap:14px;margin:0 0 12px;color:#9ca3af;font-size:12px}
+.bulk button{background:#7f1d1d;border:1px solid #f87171;color:#fff;border-radius:8px;padding:6px 12px;cursor:pointer;font-size:12px}
+.bulk button:hover{background:#991b1b}
+.rl{color:#67e8f9;margin-left:8px}
 .foot{margin-top:20px;color:#6b7280;font-size:12px;line-height:1.8}
 .showing{color:#9ca3af;font-size:12px;margin-bottom:8px}
 .note-del{color:#fbbf24;font-size:12px;margin-bottom:12px}
 @media(max-width:800px){.t,.f{display:none}}
 </style></head><body><div class="wrap">
 <h1>🖥️ 电脑 AI 问答记录梳理报告</h1>
-<div class="sub">生成时间 __GENTIME__ ｜ 由 ai-qa-report.exe 自动生成 ｜ 扫描 8 个 AI 工具数据源 ｜ 共 __TOTAL__ 条会话（已剔除 __TRIVIAL__ 条测试会话、__DUPE__ 条重复请求、__AUTO__ 条系统自动任务）</div>
+<div class="sub">生成时间 __GENTIME__ ｜ ai-qa-report v__VERSION__ ｜ 扫描 8 个 AI 工具数据源 ｜ 共 __TOTAL__ 条会话（已剔除 __TRIVIAL__ 条测试会话、__DUPE__ 条重复请求、__AUTO__ 条系统自动任务）<a class="rl" id="rl" href="/recycle" target="_blank" style="display:none">🗑 回收站</a></div>
 <div class="cards">__CARDS__</div>
 <div class="chips">__CHIPS__</div>
 <input id="q" placeholder="🔍 搜索关键词（标题/目录）…" oninput="search()">
-<div class="note-del" id="delnote" style="display:none">🗑 删除模式已启用（本地服务）：点行尾 ✕ 删除 = 移入回收目录，可手动恢复。文件型会话（Codex/Claude/豆包/Antigravity/WorkBuddy）可删；数据库型（ZCode/LobsterAI）不可删。</div>
+<div class="note-del" id="delnote" style="display:none">🗑 删除模式已启用（本地服务）：点行尾 ✕ 删除。文件型会话 = 移入回收目录；数据库型（ZCode/LobsterAI）= 整库备份到回收目录后删行。两者均可手动恢复。</div>
 <div class="showing" id="cnt"></div>
-<table><thead><tr><th>时间</th><th>工具</th><th>做了啥</th><th>记录所在文件夹</th><th></th></tr></thead>
+<div class="bulk" id="bulk" style="display:none">
+<label><input type="checkbox" id="all" onclick="toggleAll(this)"> 全选当前可见</label>
+<button onclick="delSel()">🗑 删除选中</button>
+<span id="selnote"></span>
+</div>
+<div class="pager">
+<button onclick="pagePrev()">‹ 上一页</button>
+<span id="pinfo"></span>
+<button onclick="pageNext()">下一页 ›</button>
+<span>每页</span>
+<select id="psize" onchange="setPageSize(this.value)"><option>10</option><option>20</option><option>30</option><option selected>50</option><option>100</option><option>200</option></select>
+<span>条</span>
+</div>
+<table><thead><tr><th class="chk"></th><th>时间</th><th>工具</th><th>做了啥</th><th>记录所在文件夹</th><th></th></tr></thead>
 <tbody id="tb">
 __ROWS__
 </tbody></table>
@@ -59,24 +84,92 @@ __ROWS__
 </div></div>
 <script>
 var SERVE_MODE = location.port !== '';
-if (SERVE_MODE) document.getElementById('delnote').style.display = 'block';
+if (SERVE_MODE) {
+  document.getElementById('delnote').style.display = 'block';
+  document.getElementById('bulk').style.display = 'flex';
+  document.getElementById('rl').style.display = 'inline';
+}
+var curPage=1, pageSize=50, curTool='', curQuery='';
 function filt(t, el){document.querySelectorAll('.chip').forEach(function(c){c.classList.remove('active')});if(el)el.classList.add('active');
-document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=(!t||r.dataset.tool===t)?'':'none'});cnt()}
-function search(){var q=document.getElementById('q').value.toLowerCase();
-document.querySelectorAll('#tb tr').forEach(function(r){r.style.display=r.textContent.toLowerCase().includes(q)?'':'none'});cnt()}
-function cnt(){var v=0;document.querySelectorAll('#tb tr').forEach(function(r){if(r.style.display!=='none')v++});
-document.getElementById('cnt').textContent='显示 '+v+' / __TOTAL__ 条'}
+curTool=t||''; curPage=1; apply()}
+function search(){curQuery=document.getElementById('q').value.toLowerCase(); curPage=1; apply()}
+function matchedRows(){
+  return Array.prototype.filter.call(document.querySelectorAll('#tb tr'), function(r){
+    if(curTool && r.dataset.tool!==curTool) return false;
+    if(curQuery && !r.textContent.toLowerCase().includes(curQuery)) return false;
+    return true;
+  })
+}
+function apply(){
+  var all=document.querySelectorAll('#tb tr');
+  Array.prototype.forEach.call(all, function(r){r.style.display='none'});
+  var m=matchedRows();
+  var pages=Math.max(1, Math.ceil(m.length/pageSize));
+  if(curPage>pages)curPage=pages;
+  var start=(curPage-1)*pageSize;
+  m.slice(start,start+pageSize).forEach(function(r){r.style.display=''});
+  document.getElementById('pinfo').textContent='第 '+curPage+' / '+pages+' 页 · 共 '+m.length+' 条';
+  var shown=Math.max(0, Math.min(pageSize, m.length-start));
+  document.getElementById('cnt').textContent='本页 '+shown+' 条 / 共 '+m.length+' 条（总计 __TOTAL__）';
+}
+function pagePrev(){ if(curPage>1){curPage--; apply()} }
+function pageNext(){ var pages=Math.ceil(matchedRows().length/pageSize); if(curPage<pages){curPage++; apply()} }
+function setPageSize(v){ pageSize=parseInt(v,10)||50; curPage=1; apply() }
+async function openFolder(idx, btn){
+  if(!SERVE_MODE){alert('打开文件夹需要本地服务模式：运行 ai-qa-report.exe serve 后从 http://127.0.0.1:8765 打开');return}
+  if(btn.disabled)return;
+  btn.disabled=true;
+  try{
+    var k=btn.closest('tr').dataset.k||'';
+    var resp=await fetch('/reveal/'+idx+'?k='+encodeURIComponent(k),{method:'POST'});
+    var j=await resp.json();
+    if(!j.ok) alert('打开失败: '+(j.error||'未知'));
+  }catch(e){ alert('请求失败: '+e) }
+  btn.disabled=false;
+}
 async function delRow(idx, btn){
   if(!SERVE_MODE){alert('删除功能需要本地服务模式：运行 ai-qa-report.exe serve 后从 http://127.0.0.1:8765 打开');return}
-  if(!confirm('确定删除这条会话记录？\\n（移入回收目录，可手动恢复）'))return;
+  if(!confirm('确定删除这条会话记录？\\n（文件型移入回收目录；数据库型整库备份后删行，均可恢复）'))return;
   btn.disabled = true; btn.textContent = '…';
   try{
-    const resp = await fetch('/delete/' + idx, {method:'POST'});
+    const k = btn.closest('tr').dataset.k || '';
+    const resp = await fetch('/delete/' + idx + '?k=' + encodeURIComponent(k), {method:'POST'});
     const j = await resp.json();
-    if(j.ok){ btn.closest('tr').style.opacity = .35; btn.textContent = '已删';
+    if(j.ok){ btn.closest('tr').style.opacity = .35; btn.textContent = j.skipped ? '已失效' : '已删';
       setTimeout(()=>location.reload(), 800);
     } else { alert('删除失败: ' + (j.error||'未知')); btn.disabled=false; btn.textContent='✕'; }
   }catch(e){ alert('请求失败: ' + e); btn.disabled=false; btn.textContent='✕'; }
 }
-cnt()
+function toggleAll(box){
+  document.querySelectorAll('#tb tr').forEach(function(r){
+    if(r.style.display==='none')return;
+    var c=r.querySelector('.sel');
+    if(c)c.checked=box.checked;
+  });
+  syncSel()
+}
+function syncSel(){
+  var n=document.querySelectorAll('#tb .sel:checked').length;
+  document.getElementById('selnote').textContent = n ? ('已选 '+n+' 条') : ''
+}
+async function delSel(){
+  if(!SERVE_MODE){alert('删除功能需要本地服务模式：运行 ai-qa-report.exe serve 后从 http://127.0.0.1:8765 打开');return}
+  var keys=Array.prototype.map.call(document.querySelectorAll('#tb .sel:checked'), function(c){
+    var tr=c.closest('tr'); return tr ? tr.dataset.k : ''
+  }).filter(Boolean);
+  if(!keys.length){alert('先勾选要删除的会话');return}
+  if(!confirm('确定删除选中的 '+keys.length+' 条会话记录？\\n（文件型移入回收目录；数据库型整库备份后删行，均可在回收站恢复）'))return;
+  try{
+    var resp=await fetch('/delete_batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(keys)});
+    var j=await resp.json();
+    if(j.ok){
+      var msg='已删除 '+j.deleted+' 条';
+      if(j.skipped) msg+='，跳过 '+j.skipped+' 条（扫描后已被应用清理）';
+      if(j.errors && j.errors.length) msg+='，失败 '+j.errors.length+' 条：\\n'+j.errors.slice(0,8).join('\\n');
+      alert(msg);
+      location.reload();
+    } else { alert('删除失败: '+(j.error||'未知')) }
+  }catch(e){ alert('请求失败: '+e) }
+}
+apply()
 </script></body></html>

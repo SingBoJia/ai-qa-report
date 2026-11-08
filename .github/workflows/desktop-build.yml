@@ -1,0 +1,81 @@
+name: desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["desktop-v*"]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Build Rust core
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Stage core
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path desktop\bin\win | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\ai-qa-report.exe desktop\bin\win\ai-qa-report.exe -Force
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+      - name: Package (portable)
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win portable
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-QA-Report-win-x64
+          path: desktop/dist/AI-QA-Report-*.exe
+
+  mac:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - name: Build Rust core
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage core
+        run: |
+          mkdir -p desktop/bin/mac
+          cp "target/${{ matrix.target }}/release/ai-qa-report" desktop/bin/mac/ai-qa-report
+          chmod +x desktop/bin/mac/ai-qa-report
+      - name: Install desktop deps
+        working-directory: desktop
+        run: npm ci
+      - name: Package (dmg + zip, unsigned)
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --mac --${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AI-QA-Report-mac-${{ matrix.arch }}
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.zip

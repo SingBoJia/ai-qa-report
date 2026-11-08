@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "ai-qa-report"
-version = "1.0.0"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "chrono",

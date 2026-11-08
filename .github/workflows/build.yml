@@ -30,6 +30,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: ai-qa-report-windows-x64
+          - os: windows-latest
+            target: i686-pc-windows-msvc
+            artifact: ai-qa-report-windows-x86
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

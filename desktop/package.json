@@ -1,0 +1,52 @@
+{
+  "name": "ai-qa-report-desktop",
+  "version": "0.9.2",
+  "description": "AI 问答记录梳理 桌面端（Electron 壳 + Rust 内核）",
+  "main": "main.js",
+  "author": "Ethan",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable",
+    "dist:mac": "electron-builder --mac dmg zip"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.jiaethan.aiqareport",
+    "productName": "AI问答记录",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin"
+      }
+    ],
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        "portable"
+      ]
+    },
+    "portable": {
+      "artifactName": "AI-QA-Report-${version}-win-x64.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.productivity",
+      "artifactName": "AI-QA-Report-${version}-mac-${arch}.${ext}"
+    }
+  }
+}
